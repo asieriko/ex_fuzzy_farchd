@@ -1,0 +1,11 @@
+[project]
+name = "ex-fuzzy-farchd"
+version = "0.1.0"
+description = "Ex-fuzzy compatible fuzzy classifiers"
+requires-python = ">=3.12"
+dependencies = [
+    "ex-fuzzy>=2.1.3",
+    "numpy>=2.3.2",
+    "pandas>=2.3.1",
+    "scikit-learn>=1.7.1",
+]

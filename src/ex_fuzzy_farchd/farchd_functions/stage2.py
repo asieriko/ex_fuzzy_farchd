@@ -15,7 +15,8 @@ def calculate_all_memberships(x, partitions, variables, labels):
     for var_idx, label_idx in zip(variables, labels):
         membership_values = partitions[var_idx].linguistic_variables[label_idx].membership(x[:, var_idx])
         # FIXME: How to deal with IT2, it returns  2 membership values (lower, upper)
-        _, t = membership_values.shape
+        # _, t = membership_values.shape
+        t = membership_values.ndim
         if t == 2:
             membership_values = np.mean(membership_values,axis=1)
 

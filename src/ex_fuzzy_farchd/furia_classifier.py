@@ -5,64 +5,45 @@ from sklearn.utils.multiclass import unique_labels
 from copy import deepcopy
 import warnings
 
+try:
+    from ex_fuzzy import fuzzy_sets as fs
+except ImportError:
+    import fuzzy_sets as fs
 
-class NumericAntecedent:
-    """Numeric antecedent with fuzzy intervals."""
-    
-    def __init__(self, attr_idx, split_point, value, support_bound=None):
+
+class FuzzyAntecedent:
+    """Wrapper class to store fuzzy set antecedent with metadata."""
+
+    def __init__(self, fuzzy_set, attr_idx):
+        """
+        Initialize a fuzzy antecedent.
+
+        Parameters
+        ----------
+        fuzzy_set : FS or categoricalFS
+            The fuzzy set representing this antecedent
+        attr_idx : int
+            The attribute index this antecedent applies to
+        """
+        self.fuzzy_set = fuzzy_set
         self.attr_idx = attr_idx
-        self.split_point = split_point  # Core bound
-        self.support_bound = support_bound if support_bound is not None else split_point
-        self.value = value  # 0 for <=, 1 for >=
-        self.fuzzy = support_bound is not None and support_bound != split_point
         self.confidence = 0.0
-        
-    def covers(self, instance):
-        """Return degree of coverage [0,1] for the instance."""
-        x = instance[self.attr_idx]
-        
-        if np.isnan(x):
-            return 0.0
-            
-        if self.value == 0:  # <= split_point
-            if x <= self.split_point:
-                return 1.0
-            elif self.fuzzy and self.split_point < x < self.support_bound:
-                return 1.0 - (x - self.split_point) / (self.support_bound - self.split_point)
-            else:
-                return 0.0
-        else:  # >= split_point
-            if x >= self.split_point:
-                return 1.0
-            elif self.fuzzy and self.support_bound < x < self.split_point:
-                return 1.0 - (self.split_point - x) / (self.split_point - self.support_bound)
-            else:
-                return 0.0
-    
-    def __str__(self):
-        symbol = "<=" if self.value == 0 else ">="
-        if self.fuzzy:
-            return f"X{self.attr_idx} {symbol} {self.split_point:.4f} (-> {self.support_bound:.4f})"
-        return f"X{self.attr_idx} {symbol} {self.split_point:.4f}"
 
-
-class NominalAntecedent:
-    """Nominal antecedent."""
-    
-    def __init__(self, attr_idx, value):
-        self.attr_idx = attr_idx
-        self.value = value
-        self.confidence = 0.0
-        
-    def covers(self, instance):
-        """Return 1 if covered, 0 otherwise."""
+    def membership(self, instance):
+        """Return degree of membership [0,1] for the instance."""
         x = instance[self.attr_idx]
         if np.isnan(x):
             return 0.0
-        return 1.0 if x == self.value else 0.0
-    
+        return float(self.fuzzy_set.membership(np.array([x]))[0])
+
     def __str__(self):
-        return f"X{self.attr_idx} = {self.value}"
+        if type(self.fuzzy_set) == fs.FS:
+            if self.fuzzy_set.membership_parameters[0] <= self.fuzzy_set.domain[0]:
+                return f"X{self.attr_idx}: {self.fuzzy_set.domain[0]}-{self.fuzzy_set.membership_parameters[2]:.4f}->{self.fuzzy_set.membership_parameters[3]:.4f}"
+            else:
+                return f"X{self.attr_idx}: {self.fuzzy_set.membership_parameters[0]:.4f}->{self.fuzzy_set.membership_parameters[1]:.4f}-{self.fuzzy_set.domain[1]}"
+
+        return f"X{self.attr_idx}: {self.fuzzy_set.name}"
 
 
 class FuzzyRule:
@@ -80,7 +61,7 @@ class FuzzyRule:
         """Calculate degree of coverage using product t-norm."""
         degree = 1.0
         for antd in self.antecedents:
-            degree *= antd.covers(instance)
+            degree *= antd.membership(instance)
         return degree
     
     def covers(self, instance):
@@ -93,11 +74,363 @@ class FuzzyRule:
             return np.nan
         return self.antecedents[-1].confidence
     
+    def compute_confidences(self, X, y, prior=None, m=2.0):
+        """
+        Compute confidence for each antecedent prefix using m-estimate.
+
+        This method calculates the reliability of each rule prefix (partial rule)
+        using the m-estimate formula. It should be called AFTER the rule is fully
+        built (all antecedents added).
+
+        The confidence represents: "Of all instances covered by the first i+1
+        antecedents, what proportion belong to the target class?"
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training data
+        y : array-like of shape (n_samples,)
+            Target labels
+        prior : float, optional
+            Prior probability of the consequent class. If None, computed from y.
+        m : float, default=2.0
+            Laplace smoothing parameter for m-estimate
+
+        Notes
+        -----
+        For each antecedent at position i, computes:
+            confidence = (acc + m × prior) / (cov + m)
+        where:
+            - acc: sum of fuzzy memberships for correct class instances
+            - cov: sum of fuzzy memberships for all instances
+            - m: smoothing parameter
+            - prior: P(consequent class)
+
+        Example
+        -------
+        >>> rule.add_antecedent(fs_low, attr_idx=2)
+        >>> rule.add_antecedent(fs_high, attr_idx=0)
+        >>> rule.compute_confidences(X_train, y_train)
+        >>> print(rule.antecedent_confidences)
+        [0.85, 0.92]  # First condition: 85% confident, both: 92% confident
+        """
+        self.antecedent_confidences = []
+
+        # Compute prior if not provided
+        if prior is None:
+            prior = np.sum(y == self.consequent) / len(y) if len(y) > 0 else 0.5
+
+        # Calculate confidence for each prefix
+        for i in range(len(self.antecedents)):
+            acc = 0.0  # Accurate coverage (correct class)
+            cov = 0.0  # Total coverage
+
+            # Evaluate coverage with first i+1 antecedents
+            for j in range(len(X)):
+                instance = X[j]
+                label = y[j]
+
+                # Compute fuzzy coverage degree
+                degree = 1.0
+                for k in range(i + 1):
+                    x = instance[self.antecedent_indices[k]]
+
+                    # Handle missing values
+                    if np.isnan(x):
+                        degree = 0.0
+                        break
+
+                    # Get membership
+                    membership = self.antecedents[k].membership(np.array([x]))
+                    membership_value = float(membership[0]) if isinstance(membership, np.ndarray) else float(membership)
+                    degree *= membership_value
+
+                # Accumulate coverage
+                cov += degree
+                if label == self.consequent:
+                    acc += degree
+
+            # M-estimate formula
+            confidence = (acc + m * prior) / (cov + m) if (cov + m) > 0 else 0.5
+            self.antecedent_confidences.append(confidence)
+
     def __str__(self):
         if len(self.antecedents) == 0:
             return f"=> Class {self.consequent}"
         antd_str = " AND ".join(str(a) for a in self.antecedents)
         return f"({antd_str}) => Class {self.consequent}"
+
+
+class FuriaRule:
+    """
+    FURIA rule using ex-fuzzy FS objects directly.
+
+    This class represents a fuzzy rule with:
+    - Antecedents as ex-fuzzy FS objects
+    - Antecedent indices mapping each FS to a feature
+    - Consequent as the target class
+
+    Attributes
+    ----------
+    antecedents : list[FS]
+        List of fuzzy sets (FS or categoricalFS objects) representing conditions
+    antecedent_indices : list[int]
+        List of feature indices, where antecedent_indices[i] is the feature index
+        for antecedents[i]
+    antecedent_confidences : list[float]
+        Confidence value for each antecedent prefix (from m-estimate)
+    consequent : int or any
+        The class/output value this rule predicts
+
+    Example
+    -------
+    >>> # Rule: IF (X2 is low AND X0 is high) THEN Class 1
+    >>> fs1 = fs.FS("low", [-1e10, -1e10, 1.9, 2.0])
+    >>> fs2 = fs.FS("high", [5.0, 5.5, 1e10, 1e10])
+    >>> rule = FuriaRule(
+    ...     antecedents=[fs1, fs2],
+    ...     antecedent_indices=[2, 0],
+    ...     consequent=1
+    ... )
+    >>> instance = [5.8, 3.2, 1.4, 0.3]
+    >>> coverage = rule.coverage_degree(instance)
+    """
+
+    def __init__(self, antecedents=None, antecedent_indices=None, consequent=None):
+        """
+        Initialize a FURIA rule.
+
+        Parameters
+        ----------
+        antecedents : list[FS], optional
+            List of fuzzy sets representing rule conditions
+        antecedent_indices : list[int], optional
+            List of feature indices for each antecedent
+        consequent : int or any, optional
+            The class/output predicted by this rule
+        """
+        self.antecedents = antecedents if antecedents is not None else []
+        self.antecedent_indices = antecedent_indices if antecedent_indices is not None else []
+        self.antecedent_confidences = []  # Confidence for each antecedent prefix
+        self.consequent = consequent
+
+        # Validate that antecedents and indices have same length
+        if len(self.antecedents) != len(self.antecedent_indices):
+            raise ValueError(
+                f"Length mismatch: {len(self.antecedents)} antecedents but "
+                f"{len(self.antecedent_indices)} indices"
+            )
+
+    def add_antecedent(self, fuzzy_set, attr_idx):
+        """
+        Add an antecedent to the rule.
+
+        Parameters
+        ----------
+        fuzzy_set : FS or categoricalFS
+            The fuzzy set representing the condition
+        attr_idx : int
+            The feature index this fuzzy set applies to
+        """
+        self.antecedents.append(fuzzy_set)
+        self.antecedent_indices.append(attr_idx)
+
+    def coverage_degree(self, instance):
+        """
+        Calculate the degree of coverage for an instance using product t-norm.
+
+        This computes how well the instance satisfies the rule by:
+        1. For each antecedent, extract the value at its corresponding feature index
+        2. Compute the membership degree of that value in the fuzzy set
+        3. Multiply all membership degrees together (product t-norm)
+
+        Parameters
+        ----------
+        instance : array-like
+            Feature vector to evaluate (e.g., [5.1, 3.5, 1.4, 0.2])
+
+        Returns
+        -------
+        float
+            Coverage degree in [0, 1], where:
+            - 1.0 = instance fully satisfies all conditions
+            - 0.0 = instance doesn't satisfy at least one condition
+            - (0, 1) = instance partially satisfies conditions (fuzzy)
+
+        Example
+        -------
+        >>> # Rule: IF (X2 ≤ 1.9 AND X0 ≥ 5.0) THEN Class 0
+        >>> instance = [5.5, 3.0, 1.2, 0.3]
+        >>> # X2=1.2 ≤ 1.9 → membership = 1.0
+        >>> # X0=5.5 ≥ 5.0 → membership = 1.0
+        >>> # coverage = 1.0 * 1.0 = 1.0
+        """
+        degree = 1.0
+
+        for fuzzy_set, attr_idx in zip(self.antecedents, self.antecedent_indices):
+            # Extract feature value at the specified index
+            x = instance[attr_idx]
+
+            # Handle missing values
+            if np.isnan(x):
+                return 0.0
+
+            # Compute membership degree for this antecedent
+            membership = fuzzy_set.membership(np.array([x]))
+
+            # Convert to float (handle both numpy array and scalar returns)
+            if isinstance(membership, np.ndarray):
+                membership_value = float(membership[0])
+            else:
+                membership_value = float(membership)
+
+            # Apply product t-norm
+            degree *= membership_value
+
+            # Early termination if any antecedent has 0 membership
+            if degree == 0.0:
+                return 0.0
+
+        return degree
+
+    def covers(self, instance):
+        """
+        Check if the rule covers an instance (coverage degree > 0).
+
+        Parameters
+        ----------
+        instance : array-like
+            Feature vector to check
+
+        Returns
+        -------
+        bool
+            True if coverage_degree > 0, False otherwise
+        """
+        return self.coverage_degree(instance) > 0
+
+    def get_confidence(self):
+        """
+        Get rule confidence (m-estimate).
+
+        The confidence is taken from the last antecedent's confidence value,
+        which represents the reliability of the complete rule.
+
+        Returns
+        -------
+        float
+            Confidence value in [0, 1], or np.nan if no antecedents
+        """
+        if len(self.antecedent_confidences) == 0:
+            return np.nan
+        return self.antecedent_confidences[-1]
+
+    def compute_confidences(self, X, y, prior=None, m=2.0):
+        """
+        Compute confidence for each antecedent prefix using m-estimate.
+
+        This method calculates the reliability of each rule prefix (partial rule)
+        using the m-estimate formula. It should be called AFTER the rule is fully
+        built (all antecedents added).
+
+        The confidence represents: "Of all instances covered by the first i+1
+        antecedents, what proportion belong to the target class?"
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training data
+        y : array-like of shape (n_samples,)
+            Target labels
+        prior : float, optional
+            Prior probability of the consequent class. If None, computed from y.
+        m : float, default=2.0
+            Laplace smoothing parameter for m-estimate
+
+        Notes
+        -----
+        For each antecedent at position i, computes:
+            confidence = (acc + m × prior) / (cov + m)
+        where:
+            - acc: sum of fuzzy memberships for correct class instances
+            - cov: sum of fuzzy memberships for all instances
+            - m: smoothing parameter
+            - prior: P(consequent class)
+
+        Example
+        -------
+        >>> rule.add_antecedent(fs_low, attr_idx=2)
+        >>> rule.add_antecedent(fs_high, attr_idx=0)
+        >>> rule.compute_confidences(X_train, y_train)
+        >>> print(rule.antecedent_confidences)
+        [0.85, 0.92]  # First condition: 85% confident, both: 92% confident
+        """
+        self.antecedent_confidences = []
+
+        # Compute prior if not provided
+        if prior is None:
+            prior = np.sum(y == self.consequent) / len(y) if len(y) > 0 else 0.5
+
+        # Calculate confidence for each prefix
+        for i in range(len(self.antecedents)):
+            acc = 0.0  # Accurate coverage (correct class)
+            cov = 0.0  # Total coverage
+
+            # Evaluate coverage with first i+1 antecedents
+            for j in range(len(X)):
+                instance = X[j]
+                label = y[j]
+
+                # Compute fuzzy coverage degree
+                degree = 1.0
+                for k in range(i + 1):
+                    x = instance[self.antecedent_indices[k]]
+
+                    # Handle missing values
+                    if np.isnan(x):
+                        degree = 0.0
+                        break
+
+                    # Get membership
+                    membership = self.antecedents[k].membership(np.array([x]))
+                    membership_value = float(membership[0]) if isinstance(membership, np.ndarray) else float(membership)
+                    degree *= membership_value
+
+                # Accumulate coverage
+                cov += degree
+                if label == self.consequent:
+                    acc += degree
+
+            # M-estimate formula
+            confidence = (acc + m * prior) / (cov + m) if (cov + m) > 0 else 0.5
+            self.antecedent_confidences.append(confidence)
+
+    def __str__(self):
+        """String representation of the rule."""
+        if len(self.antecedents) == 0:
+            return f"=> Class {self.consequent}"
+
+        conditions = []
+        for fuzzy_set, attr_idx in zip(self.antecedents, self.antecedent_indices):
+            conditions.append(f"X{attr_idx} is {fuzzy_set.name}")
+
+        antecedent_str = " AND ".join(conditions)
+        confidence = self.get_confidence()
+        conf_str = f" (CF={confidence:.3f})" if not np.isnan(confidence) else ""
+        return f"IF ({antecedent_str}) THEN Class {self.consequent}{conf_str}"
+
+    def __repr__(self):
+        """Detailed representation for debugging."""
+        confidence = self.get_confidence()
+        conf_val = f"{confidence:.3f}" if not np.isnan(confidence) else "N/A"
+        return (
+            f"FuriaRule("
+            f"antecedents={len(self.antecedents)}, "
+            f"indices={self.antecedent_indices}, "
+            f"consequent={self.consequent}, "
+            f"confidence={conf_val}"
+            f")"
+        )
 
 
 class FURIA(BaseEstimator, ClassifierMixin):
@@ -334,7 +667,26 @@ class FURIA(BaseEstimator, ClassifierMixin):
                     best_covered[valid_mask] = mask_1
         
         if best_split is not None:
-            antd = NumericAntecedent(attr_idx, best_split, best_value)
+            # Create FS object based on split direction
+            if best_value == 0:  # <= split_point
+                # Trapezoidal: [-inf, -inf, split_point, split_point]
+                # Initially crisp, will be fuzzified later
+                membership_params = [-1e10, -1e10, best_split, best_split]
+            else:  # >= split_point
+                # Trapezoidal: [split_point, split_point, +inf, +inf]
+                membership_params = [best_split, best_split, 1e10, 1e10]
+
+            name = f"X{attr_idx}_{'le' if best_value == 0 else 'ge'}_{best_split:.4f}"
+            fuzzy_set = fs.FS(name=name, membership_parameters=membership_params,domain=[-1e10,1e10])
+
+            # Create FuzzyAntecedent wrapper with metadata
+            antd = FuzzyAntecedent(fuzzy_set, attr_idx)
+            # Store metadata for fuzzification
+            antd.split_point = best_split
+            antd.value = best_value
+            antd.support_bound = best_split
+            antd.fuzzy = False
+
             return antd, best_gain, best_covered
         
         return None, 0.0, None
@@ -378,14 +730,15 @@ class FURIA(BaseEstimator, ClassifierMixin):
             best_support = None
             
             for idx, antd in enumerate(rule.antecedents):
-                if fuzzified[idx] or not isinstance(antd, NumericAntecedent):
+                # Check if it's a numeric fuzzy set (has metadata for fuzzification)
+                if fuzzified[idx] or not hasattr(antd, 'split_point'):
                     continue
                 
                 # Get relevant data (covered by other antecedents)
                 relevant_mask = np.ones(len(X), dtype=bool)
                 for j, other_antd in enumerate(rule.antecedents):
                     if j != idx:
-                        coverage = np.array([other_antd.covers(X[i]) for i in range(len(X))])
+                        coverage = np.array([other_antd.membership(X[i]) for i in range(len(X))])
                         relevant_mask &= (coverage > 0)
                 
                 X_relevant = X[relevant_mask]
@@ -409,9 +762,20 @@ class FURIA(BaseEstimator, ClassifierMixin):
             
             # Apply best fuzzification
             if best_support is not None:
-                rule.antecedents[best_idx].support_bound = best_support
-                rule.antecedents[best_idx].fuzzy = True
-            
+                antd = rule.antecedents[best_idx]
+                antd.support_bound = best_support
+                antd.fuzzy = True
+
+                # Update the FS membership parameters
+                if antd.value == 0:  # <= split_point
+                    membership_params = [-1e10, -1e10, antd.split_point, best_support]
+                else:  # >= split_point
+                    membership_params = [best_support, antd.split_point, 1e10, 1e10]
+
+                # Create new FS with updated parameters
+                name = f"X{antd.attr_idx}_{'le' if antd.value == 0 else 'ge'}_{antd.split_point:.4f}_fuzzy"
+                antd.fuzzy_set = fs.FS(name=name, membership_parameters=membership_params,domain=[-1e10,1e10])
+
             fuzzified[best_idx] = True
     
     def _find_best_support_bound(self, antd, X, y, class_label):
@@ -449,15 +813,21 @@ class FURIA(BaseEstimator, ClassifierMixin):
         best_support = antd.split_point
         
         for candidate in np.unique(candidates):
-            # Create temporary fuzzified antecedent
-            temp_antd = NumericAntecedent(antd.attr_idx, antd.split_point, antd.value, candidate)
-            
+            # Create temporary fuzzified FS
+            if antd.value == 0:  # <= split_point
+                membership_params = [-1e10, -1e10, antd.split_point, candidate]
+            else:  # >= split_point
+                membership_params = [candidate, antd.split_point, 1e10, 1e10]
+
+            temp_fuzzy_set = fs.FS(name="temp", membership_parameters=membership_params,domain=[-1e10,1e10])
+
             # Calculate purity
             pos_weight = 0.0
             total_weight = 0.0
             
             for i in range(len(X_valid)):
-                coverage = temp_antd.covers(X_valid[i])
+                x_val = X_valid[i, antd.attr_idx]
+                coverage = float(temp_fuzzy_set.membership(np.array([x_val]))[0])
                 total_weight += coverage
                 if y_valid[i] == class_label:
                     pos_weight += coverage
@@ -487,8 +857,8 @@ class FURIA(BaseEstimator, ClassifierMixin):
                     # Coverage by first i+1 antecedents
                     degree = 1.0
                     for k in range(i + 1):
-                        degree *= rule.antecedents[k].covers(X[j])
-                    
+                        degree *= rule.antecedents[k].membership(X[j])
+
                     cov += degree
                     if y[j] == rule.consequent:
                         acc += degree
@@ -567,7 +937,7 @@ class FURIA(BaseEstimator, ClassifierMixin):
             # Find first non-covering antecedent
             first_fail = len(rule.antecedents)
             for j, antd in enumerate(rule.antecedents):
-                if antd.covers(instance) == 0:
+                if antd.membership(instance) == 0:
                     first_fail = j
                     break
             
@@ -581,8 +951,8 @@ class FURIA(BaseEstimator, ClassifierMixin):
             # Coverage degree with remaining antecedents
             coverage = 1.0
             for j in range(remaining_antds):
-                coverage *= rule.antecedents[j].covers(instance)
-            
+                coverage *= rule.antecedents[j].membership(instance)
+
             # Confidence of last remaining antecedent
             base_confidence = rule.antecedents[remaining_antds - 1].confidence if remaining_antds > 0 else 0.5
             
